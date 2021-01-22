@@ -16,19 +16,22 @@
 package gcrcleaner
 
 import (
-	"errors"
 	"fmt"
+	"path"
 	"sort"
-	"strings"
-	"sync"
 	"time"
 
-	"github.com/gammazero/workerpool"
 	gcrauthn "github.com/google/go-containerregistry/pkg/authn"
 	gcrname "github.com/google/go-containerregistry/pkg/name"
 	gcrgoogle "github.com/google/go-containerregistry/pkg/v1/google"
 	gcrremote "github.com/google/go-containerregistry/pkg/v1/remote"
 )
+
+type manifest struct {
+	Digest string
+	Info   gcrgoogle.ManifestInfo
+	Repo   *gcrname.Repository
+}
 
 // Cleaner is a gcr cleaner.
 type Cleaner struct {
@@ -45,114 +48,90 @@ func NewCleaner(auther gcrauthn.Authenticator, c int) (*Cleaner, error) {
 	}, nil
 }
 
-// Clean deletes old images from GCR that are (un)tagged and older than "since" and
-// higher than the "keep" amount.
-func (c *Cleaner) Clean(repo string, since time.Time, allowTagged bool, keep int) ([]string, error) {
+func (c *Cleaner) getManifestsInSubtree(repo string, recursive bool, manifests []manifest) ([]manifest, error) {
 	gcrrepo, err := gcrname.NewRepository(repo)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get repo %s: %w", repo, err)
+		return []manifest{}, fmt.Errorf("failed to get repo %s: %w", repo, err)
 	}
 
 	tags, err := gcrgoogle.List(gcrrepo, gcrgoogle.WithAuth(c.auther))
 	if err != nil {
-		return nil, fmt.Errorf("failed to list tags for repo %s: %w", repo, err)
+		return []manifest{}, fmt.Errorf("failed to list tags for repo %s: %w", repo, err)
 	}
 
-	// Create a worker pool for parallel deletion
-	pool := workerpool.New(c.concurrency)
+	for k, m := range tags.Manifests {
+		manifests = append(manifests, manifest{Digest: k, Info: m, Repo: &gcrrepo})
+	}
+
+	if recursive {
+		for _, child := range tags.Children {
+			manifests, err = c.getManifestsInSubtree(path.Join(repo, child), true, manifests)
+			if err != nil {
+				return []manifest{}, err
+			}
+		}
+	}
+
+	return manifests, nil
+}
+
+// Clean deletes old images from GCR that are (un)tagged and older than "since" and
+// higher than the "keep" amount.
+func (c *Cleaner) Clean(repo string, since time.Time, allowTagged bool, keep int, recursive bool, dryRun bool) ([]string, error) {
+	if recursive {
+		fmt.Println("Processing images from whole tree")
+	}
+	var manifests = []manifest{}
+	manifests, err := c.getManifestsInSubtree(repo, recursive, manifests)
+	if err != nil {
+		return []string{}, err
+	}
 
 	var keepCount = 0
-	var deleted = make([]string, 0, len(tags.Manifests))
-	var deletedLock sync.Mutex
-	var errs = make(map[string]error)
-	var errsLock sync.RWMutex
-
-	var manifests = make([]manifest, 0, len(tags.Manifests))
-	for k, m := range tags.Manifests {
-		manifests = append(manifests, manifest{k, m})
-	}
+	var deleted = []string{}
 
 	// Sort manifest by Created from the most recent to the least
 	sort.Slice(manifests, func(i, j int) bool {
 		return manifests[j].Info.Created.Before(manifests[i].Info.Created)
 	})
 
-	for _, m := range manifests {
+	for i, m := range manifests {
+		fmt.Printf("Processing %v/%v: %v\n", i, len(manifests), m)
 		if c.shouldDelete(m.Info, since, allowTagged) {
+			fmt.Printf("Should delete %v\n", m.Info)
 			// Keep a certain amount of images
 			if keepCount < keep {
 				keepCount++
 				continue
 			}
 
-			// Deletes all tags before deleting the image
-			for _, tag := range m.Info.Tags {
-				tagged := gcrrepo.Tag(tag)
-				if err := c.deleteOne(tagged); err != nil {
-					return nil, fmt.Errorf("failed to delete %s: %w", tagged, err)
+			if !dryRun {
+				// Deletes all tags before deleting the image
+				for _, tag := range m.Info.Tags {
+					tagged := m.Repo.Tag(tag)
+					if err := c.deleteOne(tagged); err != nil {
+						return nil, fmt.Errorf("failed to delete %s: %w", tagged, err)
+					}
+				}
+				ref := m.Repo.Digest(m.Digest)
+				if err := c.deleteOne(ref); err != nil {
+					return []string{}, err
 				}
 			}
 
-			ref := gcrrepo.Digest(m.Digest)
-			pool.Submit(func() {
-				// Do not process if previous invocations failed. This prevents a large
-				// build-up of failed requests and rate limit exceeding (e.g. bad auth).
-				errsLock.RLock()
-				if len(errs) > 0 {
-					errsLock.RUnlock()
-					return
-				}
-				errsLock.RUnlock()
-
-				if err := c.deleteOne(ref); err != nil {
-					cause := errors.Unwrap(err).Error()
-
-					errsLock.Lock()
-					if _, ok := errs[cause]; !ok {
-						errs[cause] = err
-						errsLock.Unlock()
-						return
-					}
-					errsLock.Unlock()
-				}
-
-				deletedLock.Lock()
-				deleted = append(deleted, m.Digest)
-				deletedLock.Unlock()
-			})
+			deleted = append(deleted, m.Digest)
 		}
-	}
-
-	// Wait for everything to finish
-	pool.StopWait()
-
-	// Aggregate any errors
-	if len(errs) > 0 {
-		var errStrings []string
-		for _, v := range errs {
-			errStrings = append(errStrings, v.Error())
-		}
-
-		if len(errStrings) == 1 {
-			return nil, fmt.Errorf(errStrings[0])
-		}
-
-		return nil, fmt.Errorf("%d errors occurred: %s",
-			len(errStrings), strings.Join(errStrings, ", "))
 	}
 
 	return deleted, nil
-}
-
-type manifest struct {
-	Digest string
-	Info   gcrgoogle.ManifestInfo
 }
 
 // deleteOne deletes a single repo ref using the supplied auth.
 func (c *Cleaner) deleteOne(ref gcrname.Reference) error {
 	if err := gcrremote.Delete(ref, gcrremote.WithAuth(c.auther)); err != nil {
 		return fmt.Errorf("failed to delete %s: %w", ref, err)
+	} else {
+		fmt.Printf("Successfully deleted %v\n", ref)
 	}
 
 	return nil

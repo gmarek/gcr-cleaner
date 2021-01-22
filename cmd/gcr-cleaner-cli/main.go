@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strings"
 	"time"
 
 	gcrauthn "github.com/google/go-containerregistry/pkg/authn"
@@ -36,6 +37,8 @@ var (
 	gracePtr       = flag.Duration("grace", 0, "Grace period")
 	allowTaggedPtr = flag.Bool("allow-tagged", false, "Delete tagged images")
 	keepPtr        = flag.Int("keep", 0, "Minimum to keep")
+	dryRunPtr	   = flag.Bool("dry-run", false, "Don't delete anything, just print things to delete")
+	recursivePtr   = flag.Bool("recursive", false, "Delete all images in the tree")
 )
 
 func main() {
@@ -79,12 +82,21 @@ func realMain() error {
 	since := time.Now().UTC().Add(sub)
 
 	// Do the deletion.
-	fmt.Fprintf(stdout, "%s: deleting refs since %s\n", *repoPtr, since)
-	deleted, err := cleaner.Clean(*repoPtr, since, *allowTaggedPtr, *keepPtr)
+	if *dryRunPtr {
+		fmt.Fprintln(stdout, "DRY RUN MODE. NOTHING WILL GET DELETED.")
+		fmt.Fprintln(stdout, "Pass --dry-run=false flag if you want to delete refs.")
+	} else {
+		fmt.Fprintf(stdout, "%s: deleting refs since %s\n", *repoPtr, since)
+	}
+	deleted, err := cleaner.Clean(*repoPtr, since, *allowTaggedPtr, *keepPtr, *recursivePtr, *dryRunPtr)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "%s: successfully deleted %d refs", *repoPtr, len(deleted))
+	if (*dryRunPtr) {
+		fmt.Fprintf(stdout, "refs to delete:\n%v\n", strings.Join(deleted, "\n"))
+	} else {
+		fmt.Fprintf(stdout, "%s: successfully deleted %d refs\n", *repoPtr, len(deleted))
+	}
 
 	return nil
 }

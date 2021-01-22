@@ -134,7 +134,7 @@ func (s *Server) clean(r io.ReadCloser) ([]string, int, error) {
 
 	log.Printf("deleting refs for %s since %s\n", repo, since)
 
-	deleted, err := s.cleaner.Clean(repo, since, allowTagged, keep)
+	deleted, err := s.cleaner.Clean(repo, since, allowTagged, keep, false, false)
 	if err != nil {
 		return nil, 400, fmt.Errorf("failed to clean: %w", err)
 	}
